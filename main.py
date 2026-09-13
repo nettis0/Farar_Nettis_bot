@@ -1,20 +1,46 @@
 import os
+import json
 import logging
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes,
+    filters, ConversationHandler, CallbackQueryHandler,
+)
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 10000))
-EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # задаётся Render автоматически
+EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 TZ = ZoneInfo("Asia/Yekaterinburg")  # время Перми
 
-BELL_SCHEDULE_BUTTON = "Расписание звонков"
-LESSON_STATUS_BUTTON = "Какой сейчас урок"
+DATA_FILE = "data.json"
+
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"owner_id": None, "commands": {}}
+
+
+def save_data():
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(DATA, f, ensure_ascii=False, indent=2)
+
+
+DATA = load_data()
+
+BTN_BELL = "Расписание звонков"
+BTN_LESSON = "Какой сейчас урок"
+BTN_ADD = "➕ Добавить команду"
+BTN_LIST = "📋 Мои команды"
+BTN_CANCEL = "Отмена"
 
 TEMPLATES = {
     "start": "Приветствую Фарид",
@@ -42,17 +68,21 @@ SCHEDULE = [
 ]
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BELL_SCHEDULE_BUTTON], [LESSON_STATUS_BUTTON]],
+    [[BTN_BELL, BTN_LESSON], [BTN_ADD, BTN_LIST]],
     resize_keyboard=True,
 )
 
+CANCEL_KEYBOARD = ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True)
 
-def minutes_until(now: datetime, target: time) -> int:
+WAITING_TRIGGER, WAITING_RESPONSE = range(2)
+
+
+def minutes_until(now, target):
     target_dt = datetime.combine(now.date(), target, TZ)
     return int((target_dt - now).total_seconds() // 60) + 1
 
 
-def get_lesson_status() -> str:
+def get_lesson_status():
     now = datetime.now(TZ)
     now_t = now.time()
 
@@ -78,7 +108,16 @@ def get_lesson_status() -> str:
     return "Не удалось определить."
 
 
+def is_owner(update: Update) -> bool:
+    if DATA["owner_id"] is None:
+        DATA["owner_id"] = update.effective_user.id
+        save_data()
+        return True
+    return update.effective_user.id == DATA["owner_id"]
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_owner(update)
     await update.message.reply_text(TEMPLATES["start"], reply_markup=MAIN_KEYBOARD)
 
 
@@ -90,11 +129,166 @@ async def lesson_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(get_lesson_status(), reply_markup=MAIN_KEYBOARD)
 
 
+# ---- Добавление команды (по кнопке) ----
+
+async def addcmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Напиши слово-команду (триггер), на которое бот будет отвечать.",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return WAITING_TRIGGER
+
+
+async def addcmd_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == BTN_CANCEL:
+        return await addcmd_cancel(update, context)
+    trigger = update.message.text.strip().lower()
+    context.user_data["new_trigger"] = trigger
+    await update.message.reply_text(
+        "Теперь пришли ответ: текст, фото, голосовое или видео.",
+        reply_markup=CANCEL_KEYBOARD,
+    )
+    return WAITING_RESPONSE
+
+
+async def addcmd_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == BTN_CANCEL:
+        return await addcmd_cancel(update, context)
+
+    trigger = context.user_data.pop("new_trigger", None)
+    if not trigger:
+        return ConversationHandler.END
+    msg = update.message
+
+    if msg.photo:
+        entry = {"type": "photo", "file_id": msg.photo[-1].file_id, "caption": msg.caption or ""}
+    elif msg.voice:
+        entry = {"type": "voice", "file_id": msg.voice.file_id}
+    elif msg.video:
+        entry = {"type": "video", "file_id": msg.video.file_id, "caption": msg.caption or ""}
+    elif msg.video_note:
+        entry = {"type": "video_note", "file_id": msg.video_note.file_id}
+    elif msg.document:
+        entry = {"type": "document", "file_id": msg.document.file_id, "caption": msg.caption or ""}
+    elif msg.text:
+        entry = {"type": "text", "text": msg.text}
+    else:
+        await update.message.reply_text("Такой тип не поддерживается, попробуй ещё раз.")
+        return WAITING_RESPONSE
+
+    DATA["commands"][trigger] = entry
+    save_data()
+    await update.message.reply_text(f"Готово! Команда «{trigger}» сохранена.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+async def addcmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("new_trigger", None)
+    await update.message.reply_text("Отменено.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+# ---- Список / удаление команд (по кнопкам) ----
+
+def commands_inline_keyboard():
+    rows = [
+        [InlineKeyboardButton(trigger, callback_data=f"show:{trigger}")]
+        for trigger in DATA["commands"]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def listcmd_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    if not DATA["commands"]:
+        await update.message.reply_text("Пока нет ни одной команды.", reply_markup=MAIN_KEYBOARD)
+        return
+    await update.message.reply_text(
+        "Твои команды — нажми, чтобы посмотреть или удалить:",
+        reply_markup=commands_inline_keyboard(),
+    )
+
+
+async def on_show_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    trigger = query.data.split(":", 1)[1]
+    entry = DATA["commands"].get(trigger)
+    if not entry:
+        await query.edit_message_text("Эта команда уже удалена.")
+        return
+    preview = entry.get("text") or f"[{entry['type']}]"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Удалить", callback_data=f"del:{trigger}")]])
+    await query.edit_message_text(f"«{trigger}» →\n{preview}", reply_markup=kb)
+
+
+async def on_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    trigger = query.data.split(":", 1)[1]
+    DATA["commands"].pop(trigger, None)
+    save_data()
+    await query.edit_message_text(f"Команда «{trigger}» удалена.")
+
+
+# ---- Авто-ответ в бизнес-чатах ----
+
+async def send_entry(bot, chat_id, entry, business_connection_id=None):
+    kwargs = {"business_connection_id": business_connection_id} if business_connection_id else {}
+    t = entry["type"]
+    if t == "text":
+        await bot.send_message(chat_id=chat_id, text=entry["text"], **kwargs)
+    elif t == "photo":
+        await bot.send_photo(chat_id=chat_id, photo=entry["file_id"], caption=entry.get("caption") or None, **kwargs)
+    elif t == "voice":
+        await bot.send_voice(chat_id=chat_id, voice=entry["file_id"], **kwargs)
+    elif t == "video":
+        await bot.send_video(chat_id=chat_id, video=entry["file_id"], caption=entry.get("caption") or None, **kwargs)
+    elif t == "video_note":
+        await bot.send_video_note(chat_id=chat_id, video_note=entry["file_id"], **kwargs)
+    elif t == "document":
+        await bot.send_document(chat_id=chat_id, document=entry["file_id"], caption=entry.get("caption") or None, **kwargs)
+
+
+async def business_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bm = update.business_message
+    if not bm or not bm.text:
+        return
+    text_lower = bm.text.lower()
+    for trigger, entry in DATA["commands"].items():
+        if trigger in text_lower:
+            await send_entry(context.bot, bm.chat_id, entry, business_connection_id=bm.business_connection_id)
+            break
+
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Text([BELL_SCHEDULE_BUTTON]), bell_schedule))
-    app.add_handler(MessageHandler(filters.Text([LESSON_STATUS_BUTTON]), lesson_status))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_BELL]), bell_schedule))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_LESSON]), lesson_status))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_LIST]), listcmd_button))
+
+    conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_ADD]), addcmd_start),
+        ],
+        states={
+            WAITING_TRIGGER: [MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT, addcmd_trigger)],
+            WAITING_RESPONSE: [MessageHandler(filters.UpdateType.MESSAGE, addcmd_response)],
+        },
+        fallbacks=[MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_CANCEL]), addcmd_cancel)],
+    )
+    app.add_handler(conv)
+
+    app.add_handler(CallbackQueryHandler(on_show_command, pattern=r"^show:"))
+    app.add_handler(CallbackQueryHandler(on_delete_command, pattern=r"^del:"))
+
+    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, business_message_handler))
+
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
