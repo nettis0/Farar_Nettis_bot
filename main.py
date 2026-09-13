@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import requests
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from telegram import (
@@ -17,21 +18,37 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 10000))
 EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-TZ = ZoneInfo("Asia/Yekaterinburg")  # время Перми
+JSONBIN_API_KEY = os.environ["JSONBIN_API_KEY"]
+JSONBIN_BIN_ID = os.environ["JSONBIN_BIN_ID"]
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 
-DATA_FILE = "data.json"
+TZ = ZoneInfo("Asia/Yekaterinburg")  # время Перми
 
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"owner_id": None, "commands": {}}
+    try:
+        r = requests.get(
+            JSONBIN_URL + "/latest",
+            headers={"X-Master-Key": JSONBIN_API_KEY},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()["record"]
+    except Exception:
+        logging.exception("Не удалось загрузить данные из jsonbin, использую пустые")
+        return {"owner_id": None, "commands": {}}
 
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(DATA, f, ensure_ascii=False, indent=2)
+    try:
+        requests.put(
+            JSONBIN_URL,
+            json=DATA,
+            headers={"X-Master-Key": JSONBIN_API_KEY, "Content-Type": "application/json"},
+            timeout=10,
+        )
+    except Exception:
+        logging.exception("Не удалось сохранить данные в jsonbin")
 
 
 DATA = load_data()
@@ -109,7 +126,7 @@ def get_lesson_status():
 
 
 def is_owner(update: Update) -> bool:
-    if DATA["owner_id"] is None:
+    if DATA.get("owner_id") is None:
         DATA["owner_id"] = update.effective_user.id
         save_data()
         return True
