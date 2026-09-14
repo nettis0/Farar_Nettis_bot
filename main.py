@@ -57,7 +57,27 @@ BTN_BELL = "Расписание звонков"
 BTN_LESSON = "Какой сейчас урок"
 BTN_ADD = "➕ Добавить команду"
 BTN_LIST = "📋 Мои команды"
+BTN_HW_SET = "Выбор урока"
+BTN_HW_GET = "Узнать дз"
 BTN_CANCEL = "Отмена"
+
+SUBJECTS = [
+    "Алгебра и начала мат. анализа",
+    "Биология",
+    "Вероятность и статистика",
+    "География",
+    "Геометрия",
+    "Иностранный (английский) язык",
+    "Информатика",
+    "История",
+    "Литература",
+    "Обществознание",
+    "ОБЗР",
+    "Русский язык",
+    "Физика",
+    "Физическая культура",
+    "Химия",
+]
 
 TEMPLATES = {
     "start": "Приветствую Фарид",
@@ -85,7 +105,7 @@ SCHEDULE = [
 ]
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[BTN_BELL, BTN_LESSON], [BTN_ADD, BTN_LIST]],
+    [[BTN_BELL, BTN_LESSON], [BTN_HW_SET, BTN_HW_GET], [BTN_ADD, BTN_LIST]],
     resize_keyboard=True,
 )
 
@@ -251,6 +271,80 @@ async def on_delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Команда «{trigger}» удалена.")
 
 
+# ---- Домашние задания ----
+
+def subjects_inline_keyboard(prefix: str):
+    rows = []
+    for i in range(0, len(SUBJECTS), 2):
+        row = [InlineKeyboardButton(s, callback_data=f"{prefix}:{s}") for s in SUBJECTS[i:i + 2]]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+async def hw_set_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    await update.message.reply_text(
+        "Выбери предмет:",
+        reply_markup=subjects_inline_keyboard("hwset"),
+    )
+
+
+async def hw_get_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    await update.message.reply_text(
+        "Выбери предмет:",
+        reply_markup=subjects_inline_keyboard("hwget"),
+    )
+
+
+async def on_hw_set_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    subject = query.data.split(":", 1)[1]
+    context.user_data["hw_subject"] = subject
+    await query.edit_message_text(f"«{subject}» — пришли фото или напиши дз текстом.")
+
+
+async def on_hw_get_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    subject = query.data.split(":", 1)[1]
+    hw = DATA.get("homework", {}).get(subject)
+    if not hw:
+        await query.edit_message_text(f"«{subject}» — дз ещё не сохранено.")
+        return
+    header = f"«{subject}», {hw['date']} {hw['time']}:"
+    if hw["type"] == "text":
+        await query.edit_message_text(f"{header}\n{hw['text']}")
+    else:
+        await query.message.reply_text(header)
+        if hw["type"] == "photo":
+            await context.bot.send_photo(chat_id=query.message.chat_id, photo=hw["file_id"], caption=hw.get("caption") or None)
+
+
+async def hw_save_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subject = context.user_data.pop("hw_subject", None)
+    if not subject:
+        return
+    msg = update.message
+    now = datetime.now(TZ)
+    record = {"date": now.strftime("%d.%m.%Y"), "time": now.strftime("%H:%M")}
+    if msg.photo:
+        record.update({"type": "photo", "file_id": msg.photo[-1].file_id, "caption": msg.caption or ""})
+    elif msg.text:
+        record.update({"type": "text", "text": msg.text})
+    else:
+        await update.message.reply_text("Пришли фото или текст, другое не поддерживается.")
+        context.user_data["hw_subject"] = subject
+        return
+
+    DATA.setdefault("homework", {})[subject] = record
+    save_data()
+    await update.message.reply_text(f"Дз по предмету «{subject}» сохранено.", reply_markup=MAIN_KEYBOARD)
+
+
 # ---- Авто-ответ в бизнес-чатах ----
 
 async def send_entry(bot, chat_id, entry, business_connection_id=None):
@@ -288,6 +382,14 @@ def main():
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_BELL]), bell_schedule))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_LESSON]), lesson_status))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_LIST]), listcmd_button))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_HW_SET]), hw_set_start))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.Text([BTN_HW_GET]), hw_get_start))
+    app.add_handler(CallbackQueryHandler(on_hw_set_subject, pattern=r"^hwset:"))
+    app.add_handler(CallbackQueryHandler(on_hw_get_subject, pattern=r"^hwget:"))
+    app.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE & (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
+        hw_save_incoming,
+    ), group=1)
 
     conv = ConversationHandler(
         entry_points=[
